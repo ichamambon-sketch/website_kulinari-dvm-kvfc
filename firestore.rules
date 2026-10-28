@@ -1,0 +1,89 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Email staf disimpan dalam dokumen config/staff (hanya boleh ditukar dengan kelulusan manager DAN cashier semasa).
+    // Sebelum pernah ditukar, email di bawah (sama dengan config.js) digunakan.
+    function me() { return request.auth.token.email.lower(); }
+    function cfgPath() { return /databases/$(database)/documents/config/staff; }
+    function mgrEmail()  { return exists(cfgPath()) ? get(cfgPath()).data.manager : 'ichamambon@gmail.com'; }
+    function cashEmail() { return exists(cfgPath()) ? get(cfgPath()).data.cashier : 'helmi221008@gmail.com'; }
+    function isManager() { return request.auth != null && me() == mgrEmail(); }
+    function isStaff()   { return request.auth != null && (me() == mgrEmail() || me() == cashEmail()); }
+    function okEmail(e)  { return e is string && e == e.lower() && e.matches('^[^@ ]+@[^@ ]+\\.[^@ ]+$'); }
+    // Akses staf. config/staff = senarai email semasa (boleh dibaca semua kerana perlu semasa log masuk).
+    // Ia HANYA boleh ditulis jika cadangan di config/pending sudah diluluskan oleh KEDUA-DUA email semasa
+    // (manager dan cashier), dan nilai yang ditulis sama persis dengan cadangan itu.
+    function pendPath() { return /databases/$(database)/documents/config/pending; }
+    match /config/staff {
+      allow read: if true;
+      allow write: if isStaff() && exists(pendPath())
+                   && get(pendPath()).data.approvals.hasAll([mgrEmail(), cashEmail()])
+                   && request.resource.data.keys().hasOnly(['manager','cashier'])
+                   && request.resource.data.manager == get(pendPath()).data.manager
+                   && request.resource.data.cashier == get(pendPath()).data.cashier;
+    }
+    match /config/pending {
+      allow read: if isStaff();
+      // cadangan baru: dihantar oleh salah seorang staf semasa, dan hanya ada kelulusan penghantar
+      allow create: if isStaff() && request.resource.data.keys().hasOnly(['manager','cashier','by','approvals','ts'])
+                    && request.resource.data.by == me() && request.resource.data.approvals == [me()]
+                    && okEmail(request.resource.data.manager) && okEmail(request.resource.data.cashier)
+                    && request.resource.data.manager != request.resource.data.cashier
+                    && request.resource.data.ts is int;
+      // kelulusan: hanya boleh tambah email SENDIRI (tak boleh palsukan kelulusan orang lain, tak boleh ubah isi cadangan)
+      allow update: if isStaff() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['approvals'])
+                    && !(me() in resource.data.approvals)
+                    && request.resource.data.approvals.hasAll(resource.data.approvals)
+                    && request.resource.data.approvals.hasOnly(resource.data.approvals.concat([me()]))
+                    && request.resource.data.approvals.size() == resource.data.approvals.size() + 1;
+      allow delete: if isStaff();   // tolak atau batal
+    }
+    match /orders/{id} {
+      // pembeli: hanya order baru. Staf: boleh tambah rekod jualan (status apa-apa) dan padam.
+      allow create: if isStaff() || (request.resource.data.keys().hasAll(['items','total','name','phone','room','pay','status','ts','day'])
+                    && request.resource.data.status == 'baru'
+                    && request.resource.data.get('payOk', false) == false
+                    && (request.resource.data.pay != 'QR' || (request.resource.data.get('proof', '') is string
+                        && request.resource.data.proof.size() > 1000 && request.resource.data.proof.size() < 450000)));
+      allow read, update, delete: if isStaff();
+    }
+    match /menu/{id} { allow read: if true; allow write: if isManager(); }
+    // had pax harian: kedua-dua staf boleh set; pembeli boleh baca
+    match /daylimit/{id} { allow read: if true; allow write: if isStaff(); }
+    // kiraan pax dibeli setiap hari (id = tarikh_idhidangan). Pembeli hanya boleh TAMBAH, dan tidak boleh melebihi had hari itu.
+    function underLimit(d) {
+      let p = /databases/$(database)/documents/daylimit/$(d.item);
+      return !exists(p) || get(p).data.day != d.day || !(get(p).data.limit is number) || d.n <= get(p).data.limit;
+    }
+    match /used/{id} {
+      allow read: if true;
+      allow create: if isStaff() || (request.resource.data.keys().hasOnly(['day','item','n'])
+                    && request.resource.data.n is int && request.resource.data.n >= 1 && request.resource.data.n <= 50
+                    && underLimit(request.resource.data));
+      allow update: if isStaff() || (request.resource.data.keys().hasOnly(['day','item','n'])
+                    && request.resource.data.day == resource.data.day && request.resource.data.item == resource.data.item
+                    && request.resource.data.n is int && request.resource.data.n > resource.data.n
+                    && request.resource.data.n - resource.data.n <= 50
+                    && underLimit(request.resource.data));
+    }
+    // QR bayaran: setiap staf hanya boleh tukar QR sendiri (manager atau cashier); semua boleh baca
+    match /qr/{id} {
+      allow read: if true;
+      allow write: if isStaff() && ((id == 'manager' && me() == mgrEmail()) || (id == 'cashier' && me() == cashEmail()))
+                   && request.resource.data.keys().hasOnly(['img','name'])
+                   && request.resource.data.img is string && request.resource.data.img.size() < 300000;
+    }
+    // tuntutan pulangan: pembeli yang sudah bayar tetapi hidangan habis. Hanya staf boleh baca/ubah.
+    match /refunds/{id} {
+      allow create: if request.resource.data.keys().hasAll(['name','phone','amount','acct','proof','status','ts'])
+                    && request.resource.data.status == 'baru' && request.resource.data.amount is number
+                    && request.resource.data.proof is string && request.resource.data.proof.size() < 450000;
+      allow read, update, delete: if isStaff();
+    }
+    // gambar hidangan: kedua-dua staf boleh tukar (maksimum ~300KB setiap satu)
+    match /menuimg/{id} {
+      allow read: if true;
+      allow write: if isStaff() && request.resource.data.img is string && request.resource.data.img.size() < 300000;
+    }
+  }
+}
